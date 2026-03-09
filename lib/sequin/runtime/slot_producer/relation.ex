@@ -19,6 +19,7 @@ defmodule Sequin.Runtime.SlotProducer.Relation do
     field :schema, String.t()
     field :table, String.t()
     field :parent_table_id, integer()
+    field :ancestor_relations, list(t()), default: []
   end
 
   defmodule Column do
@@ -80,7 +81,8 @@ defmodule Sequin.Runtime.SlotProducer.Relation do
       columns: columns,
       schema: schema,
       table: table,
-      parent_table_id: id
+      parent_table_id: id,
+      ancestor_relations: []
     }
   end
 
@@ -100,29 +102,35 @@ defmodule Sequin.Runtime.SlotProducer.Relation do
         }
       end)
 
-    # First, determine if this is a partition and get its parent table info
-    partition_query = """
+    # Determine if this table is a native partition, uses legacy inheritance, or is a plain table.
+    # pg_class.relispartition distinguishes native partitions (true) from legacy inheritance (false).
+    relation_type_query = """
     SELECT
+      c.relispartition,
       p.inhparent as parent_id,
       pn.nspname as parent_schema,
       pc.relname as parent_name
     FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    JOIN pg_inherits p ON p.inhrelid = c.oid
-    JOIN pg_class pc ON pc.oid = p.inhparent
-    JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+    LEFT JOIN pg_inherits p ON p.inhrelid = c.oid
+    LEFT JOIN pg_class pc ON pc.oid = p.inhparent
+    LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace
     WHERE c.oid = $1;
     """
 
-    parent_info =
-      case Postgres.query(conn, partition_query, [id]) do
-        {:ok, %{rows: [[parent_id, parent_schema, parent_name]]}} ->
-          # It's a partition, use the parent info
-          %{id: parent_id, schema: parent_schema, name: parent_name}
+    {parent_info, ancestor_relations} =
+      case Postgres.query(conn, relation_type_query, [id]) do
+        # Plain table: no parents at all
+        {:ok, %{rows: [[_relispartition, nil, nil, nil]]}} ->
+          {%{id: id, schema: schema, name: table}, []}
 
-        {:ok, %{rows: []}} ->
-          # Not a partition, use its own info
-          %{id: id, schema: schema, name: table}
+        # Native partition: relispartition = true, single parent
+        {:ok, %{rows: [[true, parent_id, parent_schema, parent_name]]}} ->
+          {%{id: parent_id, schema: parent_schema, name: parent_name}, []}
+
+        # Legacy inheritance: relispartition = false with one or more parents
+        {:ok, %{rows: _rows}} ->
+          ancestors = fetch_all_ancestors(conn, id)
+          {%{id: id, schema: schema, name: table}, ancestors}
       end
 
     # Get attnums for the actual table
@@ -185,12 +193,66 @@ defmodule Sequin.Runtime.SlotProducer.Relation do
       DatabaseUpdateWorker.enqueue(db_id, unique_period: 0)
     end
 
+    # Build ancestor Relation structs for legacy inheritance.
+    # Each ancestor uses the same enriched columns as the child (same WAL tuple layout),
+    # but carries the ancestor's schema, table name, and OID.
+    built_ancestor_relations =
+      Enum.map(ancestor_relations, fn ancestor ->
+        %__MODULE__{
+          id: ancestor.id,
+          columns: enriched_columns,
+          schema: ancestor.schema,
+          table: ancestor.name,
+          parent_table_id: ancestor.id,
+          ancestor_relations: []
+        }
+      end)
+
     %__MODULE__{
       id: id,
       columns: enriched_columns,
       schema: parent_info.schema,
       table: parent_info.name,
-      parent_table_id: parent_info.id
+      parent_table_id: parent_info.id,
+      ancestor_relations: built_ancestor_relations
     }
+  end
+
+  # Recursively fetches all ancestors (parents, grandparents, etc.) for a legacy-inherited table.
+  # Stops traversal at any native partition boundary (relispartition = true).
+  defp fetch_all_ancestors(conn, table_id) do
+    recursive_ancestor_query = """
+    WITH RECURSIVE ancestors AS (
+      SELECT
+        p.inhparent AS ancestor_id,
+        pc.relname AS ancestor_name,
+        pn.nspname AS ancestor_schema
+      FROM pg_inherits p
+      JOIN pg_class pc ON pc.oid = p.inhparent
+      JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+      WHERE p.inhrelid = $1
+
+      UNION
+
+      SELECT
+        p2.inhparent AS ancestor_id,
+        pc2.relname AS ancestor_name,
+        pn2.nspname AS ancestor_schema
+      FROM ancestors a
+      JOIN pg_class child_c ON child_c.oid = a.ancestor_id
+      JOIN pg_inherits p2 ON p2.inhrelid = a.ancestor_id
+      JOIN pg_class pc2 ON pc2.oid = p2.inhparent
+      JOIN pg_namespace pn2 ON pn2.oid = pc2.relnamespace
+      WHERE child_c.relispartition = false
+    )
+    SELECT DISTINCT ancestor_id, ancestor_schema, ancestor_name
+    FROM ancestors;
+    """
+
+    {:ok, %{rows: rows}} = Postgres.query(conn, recursive_ancestor_query, [table_id])
+
+    Enum.map(rows, fn [ancestor_id, ancestor_schema, ancestor_name] ->
+      %{id: ancestor_id, schema: ancestor_schema, name: ancestor_name}
+    end)
   end
 end

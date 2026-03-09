@@ -123,10 +123,13 @@ defmodule Sequin.Runtime.SlotProducer.Processor do
   def handle_events(events, _from, state) do
     messages =
       events
-      |> Enum.map(fn %Message{} = msg ->
+      |> Enum.flat_map(fn %Message{} = msg ->
         case Decoder.decode_message(msg.payload) do
-          %type{} = payload when type in [Insert, Update, Delete, LogicalMessage] ->
-            %{msg | message: cast_message(payload, msg, state.relations)}
+          %LogicalMessage{} = payload ->
+            [%{msg | message: payload}]
+
+          %type{} = payload when type in [Insert, Update, Delete] ->
+            cast_messages(payload, msg, state.relations)
         end
       end)
       |> Enum.reject(&is_nil/1)
@@ -151,66 +154,78 @@ defmodule Sequin.Runtime.SlotProducer.Processor do
     {:noreply, [], state}
   end
 
-  @spec cast_message(decoded_message :: map(), envelope :: Message.t(), schemas :: map()) :: Message.t() | map()
-  defp cast_message(%Insert{} = payload, %Message{} = envelope, schemas) do
-    %{columns: columns, schema: schema, table: table, parent_table_id: parent_table_id} =
-      Map.get(schemas, payload.relation_id)
+  # Returns a list of SlotProducer.Message envelopes — one for the child relation itself,
+  # plus one for each ancestor relation (for legacy-inherited tables).
+  @spec cast_messages(decoded_message :: map(), envelope :: Message.t(), schemas :: map()) :: [Message.t()]
+  defp cast_messages(%Insert{} = payload, %Message{} = envelope, schemas) do
+    relation = Map.get(schemas, payload.relation_id)
+    all_relations = [relation | relation.ancestor_relations]
 
-    ids = data_tuple_to_ids(columns, payload.tuple_data)
+    Enum.with_index(all_relations)
+    |> Enum.map(fn {rel, idx} ->
+      ids = data_tuple_to_ids(rel.columns, payload.tuple_data)
 
-    %SlotProcessor.Message{
-      action: :insert,
-      errors: nil,
-      ids: ids,
-      table_schema: schema,
-      table_name: table,
-      table_oid: parent_table_id,
-      fields: data_tuple_to_fields(ids, columns, payload.tuple_data),
-      trace_id: UUID.uuid4(),
-      commit_lsn: envelope.commit_lsn,
-      commit_idx: envelope.commit_idx,
-      commit_timestamp: envelope.commit_ts,
-      transaction_annotations: envelope.transaction_annotations,
-      byte_size: envelope.byte_size,
-      batch_idx: envelope.batch_idx,
-      idempotency_key: Base.encode64("#{envelope.commit_lsn}:#{envelope.commit_idx}")
-    }
+      inner = %SlotProcessor.Message{
+        action: :insert,
+        errors: nil,
+        ids: ids,
+        table_schema: rel.schema,
+        table_name: rel.table,
+        table_oid: rel.parent_table_id,
+        fields: data_tuple_to_fields(ids, rel.columns, payload.tuple_data),
+        trace_id: UUID.uuid4(),
+        commit_lsn: envelope.commit_lsn,
+        commit_idx: envelope.commit_idx,
+        commit_timestamp: envelope.commit_ts,
+        transaction_annotations: envelope.transaction_annotations,
+        byte_size: envelope.byte_size,
+        batch_idx: envelope.batch_idx,
+        idempotency_key: idempotency_key(envelope, idx, rel.parent_table_id)
+      }
+
+      %{envelope | message: inner}
+    end)
   end
 
-  defp cast_message(%Update{} = payload, %Message{} = envelope, schemas) do
-    %{columns: columns, schema: schema, table: table, parent_table_id: parent_table_id} =
-      Map.get(schemas, payload.relation_id)
+  defp cast_messages(%Update{} = payload, %Message{} = envelope, schemas) do
+    relation = Map.get(schemas, payload.relation_id)
+    all_relations = [relation | relation.ancestor_relations]
 
-    ids = data_tuple_to_ids(columns, payload.tuple_data)
+    Enum.with_index(all_relations)
+    |> Enum.map(fn {rel, idx} ->
+      ids = data_tuple_to_ids(rel.columns, payload.tuple_data)
 
-    old_fields =
-      if payload.old_tuple_data do
-        data_tuple_to_fields(ids, columns, payload.old_tuple_data)
-      end
+      old_fields =
+        if payload.old_tuple_data do
+          data_tuple_to_fields(ids, rel.columns, payload.old_tuple_data)
+        end
 
-    %SlotProcessor.Message{
-      action: :update,
-      errors: nil,
-      ids: ids,
-      table_schema: schema,
-      table_name: table,
-      table_oid: parent_table_id,
-      old_fields: old_fields,
-      fields: data_tuple_to_fields(ids, columns, payload.tuple_data),
-      trace_id: UUID.uuid4(),
-      commit_lsn: envelope.commit_lsn,
-      commit_idx: envelope.commit_idx,
-      commit_timestamp: envelope.commit_ts,
-      transaction_annotations: envelope.transaction_annotations,
-      byte_size: envelope.byte_size,
-      batch_idx: envelope.batch_idx,
-      idempotency_key: Base.encode64("#{envelope.commit_lsn}:#{envelope.commit_idx}")
-    }
+      inner = %SlotProcessor.Message{
+        action: :update,
+        errors: nil,
+        ids: ids,
+        table_schema: rel.schema,
+        table_name: rel.table,
+        table_oid: rel.parent_table_id,
+        old_fields: old_fields,
+        fields: data_tuple_to_fields(ids, rel.columns, payload.tuple_data),
+        trace_id: UUID.uuid4(),
+        commit_lsn: envelope.commit_lsn,
+        commit_idx: envelope.commit_idx,
+        commit_timestamp: envelope.commit_ts,
+        transaction_annotations: envelope.transaction_annotations,
+        byte_size: envelope.byte_size,
+        batch_idx: envelope.batch_idx,
+        idempotency_key: idempotency_key(envelope, idx, rel.parent_table_id)
+      }
+
+      %{envelope | message: inner}
+    end)
   end
 
-  defp cast_message(%Delete{} = payload, %Message{} = envelope, schemas) do
-    %{columns: columns, schema: schema, table: table, parent_table_id: parent_table_id} =
-      Map.get(schemas, payload.relation_id)
+  defp cast_messages(%Delete{} = payload, %Message{} = envelope, schemas) do
+    relation = Map.get(schemas, payload.relation_id)
+    all_relations = [relation | relation.ancestor_relations]
 
     prev_tuple_data =
       if payload.old_tuple_data do
@@ -219,29 +234,40 @@ defmodule Sequin.Runtime.SlotProducer.Processor do
         payload.changed_key_tuple_data
       end
 
-    ids = data_tuple_to_ids(columns, prev_tuple_data)
+    Enum.with_index(all_relations)
+    |> Enum.map(fn {rel, idx} ->
+      ids = data_tuple_to_ids(rel.columns, prev_tuple_data)
 
-    %SlotProcessor.Message{
-      action: :delete,
-      errors: nil,
-      ids: ids,
-      table_schema: schema,
-      table_name: table,
-      table_oid: parent_table_id,
-      old_fields: data_tuple_to_fields(ids, columns, prev_tuple_data),
-      trace_id: UUID.uuid4(),
-      commit_lsn: envelope.commit_lsn,
-      commit_idx: envelope.commit_idx,
-      commit_timestamp: envelope.commit_ts,
-      transaction_annotations: envelope.transaction_annotations,
-      byte_size: envelope.byte_size,
-      batch_idx: envelope.batch_idx,
-      idempotency_key: Base.encode64("#{envelope.commit_lsn}:#{envelope.commit_idx}")
-    }
+      inner = %SlotProcessor.Message{
+        action: :delete,
+        errors: nil,
+        ids: ids,
+        table_schema: rel.schema,
+        table_name: rel.table,
+        table_oid: rel.parent_table_id,
+        old_fields: data_tuple_to_fields(ids, rel.columns, prev_tuple_data),
+        trace_id: UUID.uuid4(),
+        commit_lsn: envelope.commit_lsn,
+        commit_idx: envelope.commit_idx,
+        commit_timestamp: envelope.commit_ts,
+        transaction_annotations: envelope.transaction_annotations,
+        byte_size: envelope.byte_size,
+        batch_idx: envelope.batch_idx,
+        idempotency_key: idempotency_key(envelope, idx, rel.parent_table_id)
+      }
+
+      %{envelope | message: inner}
+    end)
   end
 
-  defp cast_message(%LogicalMessage{} = payload, _envelope, _relations) do
-    payload
+  # For the child relation (idx == 0), preserves the existing key format.
+  # For ancestor relations (idx > 0), appends the ancestor OID to ensure uniqueness.
+  defp idempotency_key(envelope, 0, _table_oid) do
+    Base.encode64("#{envelope.commit_lsn}:#{envelope.commit_idx}")
+  end
+
+  defp idempotency_key(envelope, _idx, table_oid) do
+    Base.encode64("#{envelope.commit_lsn}:#{envelope.commit_idx}:#{table_oid}")
   end
 
   defp internal_change?(%struct{} = msg) when struct in [Insert, Update, Delete] do

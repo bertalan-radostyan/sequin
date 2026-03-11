@@ -13,7 +13,9 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
   require Logger
 
   @type message :: ConsumerEvent.t()
-  @type cursor_tuple :: {commit_lsn :: non_neg_integer(), commit_idx :: non_neg_integer()}
+  # table_oid is included so that two messages from the same WAL event but under different
+  # table identities (child vs. ancestor in legacy inheritance) have distinct cursor keys.
+  @type cursor_tuple :: {commit_lsn :: non_neg_integer(), commit_idx :: non_neg_integer(), table_oid :: integer()}
 
   @default_setting_max_messages 50_000
 
@@ -100,8 +102,9 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
     with {:ok, incoming_payload_size_bytes} <- validate_put_messages(state, messages, opts) do
       # Insert into ETS
       {cdc_messages, backfill_messages} = Enum.split_with(messages, &is_nil(&1.table_reader_batch_id))
-      cdc_ets_keys = Enum.map(cdc_messages, fn msg -> {{msg.commit_lsn, msg.commit_idx}} end)
-      backfill_ets_keys = Enum.map(backfill_messages, fn msg -> {{msg.commit_lsn, msg.commit_idx}} end)
+      # ETS keys include table_oid to match the messages map key (3-tuple cursor).
+      cdc_ets_keys = Enum.map(cdc_messages, fn msg -> {{msg.commit_lsn, msg.commit_idx, msg.table_oid}} end)
+      backfill_ets_keys = Enum.map(backfill_messages, fn msg -> {{msg.commit_lsn, msg.commit_idx, msg.table_oid}} end)
 
       state
       |> ordered_cdc_cursors_table()
@@ -111,8 +114,10 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
       |> ordered_backfill_cursors_table()
       |> :ets.insert(backfill_ets_keys)
 
-      cursor_tuples_to_messages = Map.new(messages, fn msg -> {{msg.commit_lsn, msg.commit_idx}, msg} end)
-      ack_ids_to_cursor_tuples = Map.new(messages, fn msg -> {msg.ack_id, {msg.commit_lsn, msg.commit_idx}} end)
+      # 3-tuple key so that messages from the same WAL event but different table identities
+      # (legacy inheritance child vs. ancestors) do not overwrite each other.
+      cursor_tuples_to_messages = Map.new(messages, fn msg -> {{msg.commit_lsn, msg.commit_idx, msg.table_oid}, msg} end)
+      ack_ids_to_cursor_tuples = Map.new(messages, fn msg -> {msg.ack_id, {msg.commit_lsn, msg.commit_idx, msg.table_oid}} end)
 
       {:ok,
        %{
@@ -126,7 +131,7 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
 
   @spec message_exists?(State.t(), message()) :: boolean()
   def message_exists?(%State{} = state, message) do
-    Map.has_key?(state.messages, {message.commit_lsn, message.commit_idx})
+    Map.has_key?(state.messages, {message.commit_lsn, message.commit_idx, message.table_oid})
   end
 
   @spec put_persisted_messages(State.t(), list(message()) | Enumerable.t()) :: State.t()
@@ -147,7 +152,7 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
           {:ok, State.t()} | {:error, Error.t()}
   def put_table_reader_batch(%State{} = state, messages, batch_id) do
     messages = Enum.map(messages, &%{&1 | table_reader_batch_id: batch_id})
-    cursor_tuples = Enum.map(messages, &{&1.commit_lsn, &1.commit_idx})
+    cursor_tuples = Enum.map(messages, &{&1.commit_lsn, &1.commit_idx, &1.table_oid})
 
     unpersisted_cursor_tuples_for_table_reader_batches =
       Multiset.union(state.unpersisted_cursor_tuples_for_table_reader_batches, batch_id, MapSet.new(cursor_tuples))
@@ -183,9 +188,9 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
 
     Enum.each(popped_messages, fn msg ->
       if is_nil(msg.table_reader_batch_id) do
-        :ets.delete(cdc_table, {msg.commit_lsn, msg.commit_idx})
+        :ets.delete(cdc_table, {msg.commit_lsn, msg.commit_idx, msg.table_oid})
       else
-        :ets.delete(backfill_table, {msg.commit_lsn, msg.commit_idx})
+        :ets.delete(backfill_table, {msg.commit_lsn, msg.commit_idx, msg.table_oid})
       end
     end)
 
@@ -349,13 +354,15 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
 
   defp do_reset_message_visibility(%State{} = state, msg) do
     msg = %{msg | not_visible_until: nil}
-    cursor_tuple = {msg.commit_lsn, msg.commit_idx}
+    # The messages map key is the 3-tuple; WAL-cursor-level Multiset values remain 2-tuples.
+    msg_cursor = {msg.commit_lsn, msg.commit_idx, msg.table_oid}
+    wal_cursor = {msg.commit_lsn, msg.commit_idx}
 
     state =
       %{
         state
-        | messages: Map.put(state.messages, cursor_tuple, msg),
-          produced_message_groups: Multiset.delete(state.produced_message_groups, group_id(msg), cursor_tuple)
+        | messages: Map.put(state.messages, msg_cursor, msg),
+          produced_message_groups: Multiset.delete(state.produced_message_groups, group_id(msg), wal_cursor)
       }
 
     {state, msg}
@@ -367,8 +374,9 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
 
     min_messages_wal_cursor =
       state.messages
-      |> Stream.reject(fn {cursor_tuple, _msg} ->
-        MapSet.member?(persisted_message_cursor_tuples, cursor_tuple)
+      |> Stream.reject(fn {{commit_lsn, commit_idx, _table_oid}, _msg} ->
+        # persisted_message_cursor_tuples uses 2-tuple WAL cursors; extract them from the 3-tuple map key.
+        MapSet.member?(persisted_message_cursor_tuples, {commit_lsn, commit_idx})
       end)
       |> Stream.map(fn {_k, msg} -> {msg.commit_lsn, msg.commit_idx} end)
       |> Enum.min(fn -> nil end)
@@ -420,7 +428,7 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
        state
        | produced_message_groups: produced_message_groups,
          # Replace messages in state to set last_delivered_at
-         messages: Map.merge(state.messages, Map.new(messages, &{{&1.commit_lsn, &1.commit_idx}, &1}))
+         messages: Map.merge(state.messages, Map.new(messages, &{{&1.commit_lsn, &1.commit_idx, &1.table_oid}, &1}))
      }}
   end
 
@@ -641,14 +649,15 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
     message_cursor_tuples = Map.keys(state.messages)
 
     messages_not_in_ets =
-      Enum.count(message_cursor_tuples, fn {commit_lsn, commit_idx} ->
-        not :ets.member(cdc_table, {commit_lsn, commit_idx}) and not :ets.member(backfill_table, {commit_lsn, commit_idx})
+      Enum.count(message_cursor_tuples, fn {commit_lsn, commit_idx, table_oid} ->
+        not :ets.member(cdc_table, {commit_lsn, commit_idx, table_oid}) and
+          not :ets.member(backfill_table, {commit_lsn, commit_idx, table_oid})
       end)
 
     cdc_ets_not_in_messages =
       :ets.foldl(
-        fn {{commit_lsn, commit_idx}} = _cursor_tuple, acc ->
-          if Map.has_key?(state.messages, {commit_lsn, commit_idx}) do
+        fn {{commit_lsn, commit_idx, table_oid}} = _cursor_tuple, acc ->
+          if Map.has_key?(state.messages, {commit_lsn, commit_idx, table_oid}) do
             acc
           else
             acc + 1
@@ -660,8 +669,8 @@ defmodule Sequin.Runtime.SlotMessageStore.State do
 
     backfill_ets_not_in_messages =
       :ets.foldl(
-        fn {{commit_lsn, commit_idx}} = _cursor_tuple, acc ->
-          if Map.has_key?(state.messages, {commit_lsn, commit_idx}) do
+        fn {{commit_lsn, commit_idx, table_oid}} = _cursor_tuple, acc ->
+          if Map.has_key?(state.messages, {commit_lsn, commit_idx, table_oid}) do
             acc
           else
             acc + 1

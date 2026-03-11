@@ -186,3 +186,184 @@ end
 ```
 
 When `idx == 0` (the child itself), the key is identical to the old format — backward-compatible for non-inherited tables and for existing consumers subscribed to the child. For ancestor messages (`idx > 0`), the ancestor's OID is appended to make the key globally unique, so each copy of the event can be safely deduplicated independently by downstream consumers.
+
+---
+
+## Bug fix: `slot_message_store_state.ex` — `payload_size_bytes` corruption
+
+### Root cause
+
+`put_messages` keyed the in-memory messages map by `{commit_lsn, commit_idx}`. With legacy inheritance, a single WAL event now produces **multiple messages with the same commit position** — one for the child table and one per ancestor. When a consumer with a broad subscription (no `include_table_oids` filter) received both copies in the same batch:
+
+1. `validate_put_messages` counted bytes for **all N** messages.
+2. `Map.new(messages, ...)` **collapsed** them to **one** entry (last writer wins, because they all shared the same `{commit_lsn, commit_idx}` key).
+3. `payload_size_bytes` was incremented by the full N-message byte count.
+4. On acknowledgement, only the one stored message's bytes were subtracted — leaving `(N−1) × byte_size` as a phantom residual.
+5. Eventually the map emptied but `payload_size_bytes > 0`, triggering:
+
+```
+Logger.error("Popped messages bytes is greater than 0 when there are no messages in the state")
+```
+
+### Fix
+
+The cursor key was extended from a 2-tuple to a 3-tuple throughout every place it is used as a **messages-map or ETS entry key**:
+
+```elixir
+# before
+{commit_lsn, commit_idx}
+
+# after
+{commit_lsn, commit_idx, table_oid}
+```
+
+This ensures that a child message and its ancestor messages have **distinct keys** even when they originate from the same WAL event, so all copies are stored and their bytes are counted and decremented independently.
+
+---
+
+### 9. `cursor_tuple` type definition
+
+```elixir
+# before
+@type cursor_tuple :: {commit_lsn :: non_neg_integer(), commit_idx :: non_neg_integer()}
+
+# after
+@type cursor_tuple :: {commit_lsn :: non_neg_integer(), commit_idx :: non_neg_integer(), table_oid :: integer()}
+```
+
+Reflects the new 3-tuple shape at the type level.
+
+---
+
+### 10. ETS key construction and deletion (`put_messages`, `pop_messages`)
+
+```elixir
+# before
+{{msg.commit_lsn, msg.commit_idx}}
+:ets.delete(cdc_table, {msg.commit_lsn, msg.commit_idx})
+
+# after
+{{msg.commit_lsn, msg.commit_idx, msg.table_oid}}
+:ets.delete(cdc_table, {msg.commit_lsn, msg.commit_idx, msg.table_oid})
+```
+
+The ETS tables are `ordered_set` tables used for per-message delivery ordering. They were updated to use the 3-tuple key to stay in sync with the messages map. Ordering is still primarily by `commit_lsn` then `commit_idx`; `table_oid` only affects ordering of messages from the same WAL event, which is arbitrary and acceptable.
+
+---
+
+### 11. `cursor_tuples_to_messages` and `ack_ids_to_cursor_tuples` in `put_messages`
+
+```elixir
+# before
+cursor_tuples_to_messages = Map.new(messages, fn msg -> {{msg.commit_lsn, msg.commit_idx}, msg} end)
+ack_ids_to_cursor_tuples  = Map.new(messages, fn msg -> {msg.ack_id, {msg.commit_lsn, msg.commit_idx}} end)
+
+# after
+cursor_tuples_to_messages = Map.new(messages, fn msg -> {{msg.commit_lsn, msg.commit_idx, msg.table_oid}, msg} end)
+ack_ids_to_cursor_tuples  = Map.new(messages, fn msg -> {msg.ack_id, {msg.commit_lsn, msg.commit_idx, msg.table_oid}} end)
+```
+
+Both maps now use the 3-tuple. Because `ack_ids_to_cursor_tuples` is the source of cursor tuples for all external acknowledgement calls (`messages_succeeded`, `messages_failed`, etc. in `slot_message_store.ex`), no changes were needed outside `slot_message_store_state.ex` — the external code always retrieves cursor tuples from the state rather than constructing them directly.
+
+---
+
+### 12. `message_exists?`
+
+```elixir
+# before
+Map.has_key?(state.messages, {message.commit_lsn, message.commit_idx})
+
+# after
+Map.has_key?(state.messages, {message.commit_lsn, message.commit_idx, message.table_oid})
+```
+
+The deduplication guard that prevents re-ingesting a message already in the store now correctly distinguishes child and ancestor messages as separate entries, so neither is falsely rejected.
+
+---
+
+### 13. `do_reset_message_visibility`
+
+```elixir
+# before
+cursor_tuple = {msg.commit_lsn, msg.commit_idx}
+messages: Map.put(state.messages, cursor_tuple, msg),
+produced_message_groups: Multiset.delete(state.produced_message_groups, group_id(msg), cursor_tuple)
+
+# after
+msg_cursor = {msg.commit_lsn, msg.commit_idx, msg.table_oid}  # messages map key
+wal_cursor = {msg.commit_lsn, msg.commit_idx}                 # Multiset value (WAL cursor level)
+messages: Map.put(state.messages, msg_cursor, msg),
+produced_message_groups: Multiset.delete(state.produced_message_groups, group_id(msg), wal_cursor)
+```
+
+A single variable was split into two to make the distinction explicit: `msg_cursor` (3-tuple, used for the messages map) vs. `wal_cursor` (2-tuple, used for group-tracking Multisets that operate at the WAL position level rather than the per-table-message level).
+
+---
+
+### 14. `min_unpersisted_wal_cursor` — persisted check
+
+```elixir
+# before
+Stream.reject(fn {cursor_tuple, _msg} ->
+  MapSet.member?(persisted_message_cursor_tuples, cursor_tuple)
+end)
+
+# after
+Stream.reject(fn {{commit_lsn, commit_idx, _table_oid}, _msg} ->
+  MapSet.member?(persisted_message_cursor_tuples, {commit_lsn, commit_idx})
+end)
+```
+
+`persisted_message_cursor_tuples` is built from `persisted_message_groups` Multiset values, which are 2-tuples `{commit_lsn, commit_idx}` (WAL cursor level). The map keys are now 3-tuples, so the comparison extracts the first two elements to compare at the correct granularity.
+
+---
+
+### 15. `produce_messages` — messages map update
+
+```elixir
+# before
+Map.new(messages, &{{&1.commit_lsn, &1.commit_idx}, &1})
+
+# after
+Map.new(messages, &{{&1.commit_lsn, &1.commit_idx, &1.table_oid}, &1})
+```
+
+The map merge that writes back updated `last_delivered_at` timestamps uses the 3-tuple key so ancestor messages are updated at their own entries.
+
+---
+
+### 16. `audit_state`
+
+```elixir
+# before
+Enum.count(message_cursor_tuples, fn {commit_lsn, commit_idx} ->
+  not :ets.member(cdc_table, {commit_lsn, commit_idx}) ...
+end)
+
+fn {{commit_lsn, commit_idx}} = _cursor_tuple, acc ->
+  if Map.has_key?(state.messages, {commit_lsn, commit_idx}) do ...
+
+# after
+Enum.count(message_cursor_tuples, fn {commit_lsn, commit_idx, table_oid} ->
+  not :ets.member(cdc_table, {commit_lsn, commit_idx, table_oid}) ...
+end)
+
+fn {{commit_lsn, commit_idx, table_oid}} = _cursor_tuple, acc ->
+  if Map.has_key?(state.messages, {commit_lsn, commit_idx, table_oid}) do ...
+```
+
+The consistency audit that cross-checks the messages map against both ETS tables was updated so that the ETS key pattern matches and the messages map lookups all use the 3-tuple.
+
+---
+
+### What was intentionally left unchanged
+
+The following use `{commit_lsn, commit_idx}` as **Multiset values** or **WAL cursor positions**, not as messages-map keys. They operate at the commit-position level (one entry per WAL event, regardless of how many table-identity copies exist) and were left as 2-tuples:
+
+| Location | Purpose |
+|----------|---------|
+| `persisted_message_groups` Multiset values | Track which WAL positions are persisted per group |
+| `produced_message_groups` Multiset values | Track which WAL positions are in-flight per group |
+| `backfill_message_groups` Multiset values | Track which WAL positions belong to backfill batches |
+| `message_persisted?` | Checks a 2-tuple WAL cursor in the persisted Multiset |
+| `min_unpersisted_wal_cursor` extraction | Derives `{commit_lsn, commit_idx}` from message fields for cursor reporting |
